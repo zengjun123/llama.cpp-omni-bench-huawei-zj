@@ -579,6 +579,8 @@ struct common_params {
     std::string projector_model          = ""; // projector GGUF
     std::string tts_bin_dir              = ""; // directory containing TTS projector/token2wav assets
     bool vpm_batch_encode                = false; // batch-encode same-size vision slices (off by default; helps large/high-res images)
+    int encoder_queue_cap                = 0; // control the encoder queue max length
+    int prefill_queue_cap                = 0; // control the prefill queue max length
 
     // VoxCPM2 TTS
     std::string voxcpm2_base_lm      = ""; // VoxCPM2 BaseLM GGUF path

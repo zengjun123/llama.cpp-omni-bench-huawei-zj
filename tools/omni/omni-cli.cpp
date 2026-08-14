@@ -140,14 +140,14 @@ static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
     OmniModelPaths paths;
     paths.llm = llm_path;
     paths.base_dir = get_parent_dir(llm_path);
-    
+
     // 自动推断其他模型路径
     paths.vision = paths.base_dir + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
     paths.audio = paths.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
     paths.tts = paths.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
     paths.projector = paths.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
     paths.vision_coreml = paths.base_dir + "/vision/coreml_minicpmo45_vit_all_f16.mlmodelc";
-    
+
     return paths;
 }
 
@@ -168,7 +168,7 @@ void test_case(struct omni_context *ctx_omni, common_params& params, std::string
     ctx_omni->system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
     ctx_omni->async = false;  // 使用同步模式 prefill，确保所有数据被处理
-    
+
     for (int il = 0; il < cnt; ++il) {
         char idx_str[16];
         snprintf(idx_str, sizeof(idx_str), "%04d", il);  // 格式化为4位数字，如 0000, 0001
@@ -194,7 +194,7 @@ void test_case(struct omni_context *ctx_omni, common_params& params, std::string
             std::cout << "prefill " << il << " (audio+vision) : " << dt << " s" << std::endl;
         }
     }
-    
+
     // 所有数据同步 prefill 完成后，恢复 async 模式并调用 decode
     // 注意：同步 prefill 不会启动线程，需要用 async=true 的方式调用 decode
     // stream_decode 内部会检查 async 并启动 TTS/T2W 线程
@@ -222,13 +222,15 @@ int main(int argc, char ** argv) {
     bool use_tts = true;
     bool run_test = false;
     bool vision_batch_encode = false;  // 多 slice 批量编码优化（默认关闭）
+    int encoder_queue_cap = 0;
+    int prefill_queue_cap = 0;
     std::string test_audio_prefix;
     int test_count = 0;
-    
+
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if (arg == "-h" || arg == "--help") {
             show_usage(argv[0]);
             return 0;
@@ -287,13 +289,19 @@ int main(int argc, char ** argv) {
         else if (arg == "--bench-vision" && i + 1 < argc) {
             bench_vision_image = argv[++i];
         }
+        else if (arg == "--encoder_queue_cap" && i + 1 < argc){
+            encoder_queue_cap = std::atoi(argv[++i]);
+        }
+        else if (arg == "--prefill_queue_cap" && i + 1 < argc){
+            prefill_queue_cap = std::atoi(argv[++i]);
+        }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             show_usage(argv[0]);
             return 1;
         }
     }
-    
+
     // vision-only benchmark: only needs vision model, skip full init
     if (!bench_vision_image.empty()) {
         if (llm_path.empty()) {
@@ -325,19 +333,19 @@ int main(int argc, char ** argv) {
         show_usage(argv[0]);
         return 1;
     }
-    
+
     // 解析模型路径
     OmniModelPaths paths = resolve_model_paths(llm_path);
-    
+
     // 应用覆盖路径
     if (!vision_path_override.empty()) paths.vision = vision_path_override;
     if (!audio_path_override.empty()) paths.audio = audio_path_override;
     if (!tts_path_override.empty()) paths.tts = tts_path_override;
     if (!projector_path_override.empty()) paths.projector = projector_path_override;
-    
+
     // 打印模型路径
     print_model_paths(paths);
-    
+
     // 检查必需文件
     if (!file_exists(paths.llm)) {
         fprintf(stderr, "Error: LLM model not found: %s\n", paths.llm.c_str());
@@ -351,7 +359,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Warning: TTS model not found: %s, disabling TTS\n", paths.tts.c_str());
         use_tts = false;
     }
-    
+
     // 设置参数
     common_params params;
     params.model.path = paths.llm;
@@ -369,7 +377,10 @@ int main(int argc, char ** argv) {
     params.vpm_batch_encode = vision_batch_encode;
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
-    
+
+    params.encoder_queue_cap = encoder_queue_cap;
+    params.prefill_queue_cap = prefill_queue_cap;
+
     // Projector 路径需要通过 tts_bin_dir 传递
     // omni.cpp 中 projector 路径计算: gguf_root_dir + "/projector.gguf"
     // 其中 gguf_root_dir = tts_bin_dir 的父目录
@@ -377,9 +388,9 @@ int main(int argc, char ** argv) {
     // 所以需要修改 omni.cpp 或者创建符号链接
     // 这里暂时使用 tts 目录作为 tts_bin_dir
     std::string tts_bin_dir = get_parent_dir(paths.tts);
-    
+
     common_init();
-    
+
     printf("=== Initializing Omni Context ===\n");
     printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
@@ -395,7 +406,7 @@ int main(int argc, char ** argv) {
     if (!params.token2wav_coreml_model_path.empty()) {
         printf("  T2W CoreML: %s\n", params.token2wav_coreml_model_path.c_str());
     }
-    
+
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
     if (ctx_omni == nullptr) {
