@@ -32,6 +32,11 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
   --model /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
   --video assets/video/omni_duplex1.mp4 \
   --min-free-mib 22000
+
+ ./run_judge_direct.sh --gpu 0 \
+  --model /workspace/shared_assets/models/OpenBMB/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
+  --video assets/video/omni_duplex1.mp4 \
+  --min-free-mib 22000
 ```
 
 多视频：

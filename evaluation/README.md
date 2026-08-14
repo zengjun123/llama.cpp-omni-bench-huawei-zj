@@ -112,6 +112,7 @@ cd evaluation
 ./run_all.sh --tasks videomme,rts --smoke 2
 ./run_all.sh --tasks videomme,daily-omni,tts,rts --full --no-build
 ./run_eval.sh tts --smoke 5
+./run_all.sh --tasks daily-omni --no-build --smoke 2
 ```
 
 覆盖模型或卡号：
@@ -227,18 +228,18 @@ tools/omni/CMakeLists.txt
 
 ## 6. 常见问题
 
-**Python 环境**  
+**Python 环境**
 精度与 TTS 打分用 `EVAL_PYTHON`，RTS 用 `RTS_PYTHON`，可指向同一 venv。PyTorch 需按平台单独安装。
 
-**F16 权重**  
+**F16 权重**
 必须保持 `GGML_CANN_WEIGHT_NZ=off`，否则可能出现空串、换行复读等异常输出。
 
-**Ascend ACL Graph**  
+**Ascend ACL Graph**
 必须保持 `GGML_CANN_ACL_GRAPH=off`，否则 vision encode 阶段可能因非法同步拷贝直接 abort。
 
-**SIM 打分**  
+**SIM 打分**
 离线环境请预先配置好 `WAVLM_LARGE_PT` 与 `S3PRL_REPO`；`run_eval.py` 会把权重链入 s3prl 缓存目录。若日志提示找不到 `wavlm_large.pt`，先修正 `config.env` 再跑。SIM 为单进程 CPU；`--smoke N` 表示**每张卡**前 N 条，若只想总共 N 条请加 `--device-count 1`。
 
-**官方评分**  
+**官方评分**
 smoke / 子集模式下会跳过官方 Overall（子集无法满足 short/medium/long 各 300 视频的断言）。需要官方分请跑 `--full`。
 

@@ -14,11 +14,16 @@ Build the `llama-omni-eval-daily-cli` target from a compatible `llama.cpp-omni` 
 
 ```bash
 cd /path/to/llama.cpp-omni
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DGGML_CANN=ON -DGGML_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-eval-daily-cli -j
 ```
 
 Create `.env` from `.env.example` and provide the CLI executable, GGUF model, and Daily-Omni dataset paths. Download the MiniCPM-o GGUF model from [openbmb/MiniCPM-o-4_5-gguf](https://huggingface.co/openbmb/MiniCPM-o-4_5-gguf). The dataset must provide the JSONL annotation file and media paths referenced by it.
+```bash
+cp .env.example .env
+
+python convert_daily_omni_modelscope.py --src /workspace/user_data/datasets/Daily-Omni-modelscope --dst /workspace/user_data/datasets/Daily-Omni
+```
 
 ## Run
 
