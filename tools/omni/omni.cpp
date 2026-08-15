@@ -19,6 +19,7 @@
 #include "ggml-cann.h"
 #include <acl/acl.h>
 #endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
@@ -310,11 +311,24 @@ struct omni_output {
     int idx;
 };
 
+// Per-chunk stage timings (filled along duplex pipeline, exposed via SSE metrics).
+struct DuplexChunkTimings {
+    int    index = 0;
+    double vpm_ms = 0.0;
+    double apm_ms = 0.0;
+    double llm_prefill_ms = 0.0;
+    double llm_decode_ms = 0.0;
+    double tts_ms = 0.0;
+    double token2wav_ms = 0.0;
+};
+
 struct DuplexDecodeReq {
     std::string        debug_dir;
     int                round_idx = -1;
     std::atomic<bool>  done{false};
     std::atomic<bool>  ok{false};
+    DuplexChunkTimings chunk_timings;
+    bool have_packet_timings = false;
 };
 
 struct LLMOut {
@@ -326,6 +340,8 @@ struct LLMOut {
     std::vector<llama_token> token_ids;  // LLM生成的token IDs
     std::vector<float> hidden_states;   // LLM的hidden states (n_tokens * n_embd)
     int n_embd = 0;  // hidden states的维度
+    bool frame_idle = false;
+
     int decode_start_cache_len;
     std::chrono::high_resolution_clock::time_point t_dec_begin;
     int  n_past_dec_0;
@@ -1202,7 +1218,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
     print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
 }
 
-static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
+bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb) {
     int N = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, N);
 
@@ -1241,7 +1257,7 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
 
 // 与 eval_tokens 类似，但会将每次 decode 的 hidden_state 保存并拼接到 hidden_states 中
 // hidden_states 由函数内部分配空间，大小为 N * n_embd * sizeof(float)，调用者负责释放
-static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, float *& hidden_states) {
+bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, float *& hidden_states) {
     int N = (int) tokens.size();
     if (N == 0) {
         hidden_states = nullptr;
@@ -2168,7 +2184,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
 // 1. 在omni_context中添加emb_text_weight字段（float*, 152064 * 768）
 // 2. 在omni_init中从TTS模型文件加载emb_text权重
 // 3. 在这里实现查找逻辑
-static bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
+bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
     // Check if weights are loaded
     if (!ctx_omni->emb_text_weight) {
         LOG_ERR("TTS: emb_text_weight not loaded\n");
@@ -2213,7 +2229,7 @@ static bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, f
 //     hidden_proj = ReLU(linear1(hidden) + bias1)  // (1, 4096) @ (4096, 768) = (1, 768)
 //     hidden_proj = linear2(hidden_proj) + bias2    // (1, 768) @ (768, 768) = (1, 768)
 //   归一化在调用者中完成（使用normalize_l2_per_token）
-static bool tts_projector_semantic(struct omni_context * ctx_omni,
+bool tts_projector_semantic(struct omni_context * ctx_omni,
                                     const float * llm_hidden_states, int n_tokens, int llm_n_embd,
                                     float * projected_hidden_states, int tts_n_embd) {
     // 优先使用新的 ggml 实现 (精度验证版本)
@@ -2306,7 +2322,7 @@ static bool tts_projector_semantic(struct omni_context * ctx_omni,
 // 辅助函数：L2归一化（对每个token的embedding分别归一化）
 // 匹配Python的 F.normalize(hidden_embeds, p=2, dim=-1)
 // 注意：PyTorch的F.normalize使用sqrt(sum(x^2) + eps)，然后除以norm
-static void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f) {
+void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps) {
     for (int t = 0; t < n_tokens; t++) {
         float * vec = embeddings + t * n_embd;
 
@@ -3023,7 +3039,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     return id;
 }
 
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk = false) {
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk) {
     // Debug: Save logits directory (set via environment variable)
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
 
@@ -3660,10 +3676,10 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
  * 🔧 [turn 级滑窗] 删除最早的一个已完成 turn（按 turn 粒度一次性丢）
  *
  * 行为：
- *   1. 在 unit_history 里找到在最小删除长度的限制内的所有 system unit 的 turn_id（放入turn_ids里）。
- *   2. 如果 turn_id >= current_turn_id，说明 unit_history 里只剩下当前还没收尾的 turn，
- *      这种情况下如果此时也没有其他turn需要进行删除则函数返回 false，交给上层退化成按 unit 删。
- *   3. 否则收集"前缀"中所有非 system 且 turn_id in turn_ids 的 unit，把它们的 length
+ *   1. 在 unit_history 里找到第一条非 system unit 的 turn_id（记为 earliest）。
+ *   2. 如果 earliest >= current_turn_id，说明 unit_history 里只剩下当前还没收尾的 turn，
+ *      这种情况下函数返回 false，交给上层退化成按 unit 删。
+ *   3. 否则收集"前缀"中所有非 system 且 turn_id == earliest 的 unit，把它们的 length
  *      累加起来一次性从 KV cache 中丢掉，并从 unit_history 里擦除对应条目。
  *
  * 设计依据：
@@ -3671,89 +3687,60 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
  *     所以最小 turn_id 的 unit 一定集中在 unit_history 的前缀段。
  *   - 用一次 sliding_window_drop_tokens_from_cache(total_len) 来移动 KV，
  *     比 per-unit 循环调用更省：只做一次 llama_memory_seq_rm + 一次 seq_add。
- *   - 一次删除所有turn可以避免过多的冗余判断
  *
  * @return true 成功丢掉一个完整 turn；false 表示当前没有"已完成且非 system"的 turn 可丢
  */
-static bool sliding_window_drop_next_turn(struct omni_context * ctx_omni, int length_to_be_deleted) {
+static bool sliding_window_drop_next_turn(struct omni_context * ctx_omni) {
     if (!ctx_omni || ctx_omni->unit_history.empty()) {
         return false;
     }
 
-    std::unordered_set<int> turn_ids;  //用来记录本轮需要删除的turn
-    std::vector<int> length_fragments;  //用来记录本轮删除的kv cache碎片，这里用vector主要是为了兼容user kv cache之间可能会插入system kv cache的情况
-    int total_len = 0;
-    int n_units   = 0;
-    // 1) 找到最早一条非 system unit 且并未被找过的 turn_id
-    while(total_len < length_to_be_deleted){  //total_len指代的含义是本轮需要删除的长度，如果这个长度小于需要删除的长度的话则继续筛选turn
-        int earliest_turn = -1;
-        bool is_system = true;   //用于判断当前turn的length是否可以和上一turn进行合并
-        for (const auto & e : ctx_omni->unit_history) {
-            if (e.type == "system"){
-                is_system = true;
-                continue;
-            }
-            is_system = false;
-            if (turn_ids.find(e.turn_id) != turn_ids.end()) continue;
-            earliest_turn = e.turn_id;
-            break;
-        }
-        if (earliest_turn < 0) {
-            // 只剩 system 条目，没什么可丢的
-            break;
-        }
-
-        // 2) 判断这个 turn 是否已经完结
-        //    - current_turn_id 指向"正在构建中的 turn"，它 ≥ earliest_turn
-        //    - 如果此时turn_ids存在有效turn，则直接退出循环,开始进行删除
-        //    - 只有当 earliest_turn < current_turn_id 时，earliest_turn 才真正已经收尾，
-        //      这时按 turn 一次性丢掉才安全（不会把活跃轮次从中间砍半）
-        //    - 否则（只剩当前 turn）返回 false，让 enforce 退化到按 unit 丢
-        if (earliest_turn >= ctx_omni->current_turn_id && turn_ids.size()==0) {
-            print_with_timestamp("[SW] drop_next_turn: only current turn (turn_id=%d) left in history, "
-                                 "fall back to unit-level drop\n", earliest_turn);
-            return false;
-        }else if(earliest_turn >= ctx_omni->current_turn_id && turn_ids.size()!=0){
-            break;
-        }
-
-        // 3) 收集前缀里所有 turn_id == earliest_turn 的非 system unit
-        //    （遇到 turn_id 更大的 unit 就停；system 单独跳过但不打断）
-        int turn_len = 0;
-        for (const auto & e : ctx_omni->unit_history) {
-            if (e.type == "system") continue;
-            if (e.turn_id != earliest_turn && turn_ids.find(e.turn_id)==turn_ids.end()) break;
-            turn_len += e.length;
-            n_units++;
-        }
-        total_len += turn_len;
-        // 根据当前turn_id的前面是不是system unit来判断此turn_id的kv删除是否需要合并到前一个turn_id的删除里
-        if(!is_system){
-            length_fragments[length_fragments.size()-1] += turn_len;
-        }else{
-            length_fragments.push_back(turn_len);
-        }
-        turn_ids.insert(earliest_turn);
+    // 1) 找到最早一条非 system unit 的 turn_id
+    int earliest_turn = -1;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        earliest_turn = e.turn_id;
+        break;
+    }
+    if (earliest_turn < 0) {
+        // 只剩 system 条目，没什么可丢的
+        return false;
     }
 
-    if(turn_ids.size()==0){
+    // 2) 判断这个 turn 是否已经完结
+    //    - current_turn_id 指向"正在构建中的 turn"，它 ≥ earliest_turn
+    //    - 只有当 earliest_turn < current_turn_id 时，earliest_turn 才真正已经收尾，
+    //      这时按 turn 一次性丢掉才安全（不会把活跃轮次从中间砍半）
+    //    - 否则（只剩当前 turn）返回 false，让 enforce 退化到按 unit 丢
+    if (earliest_turn >= ctx_omni->current_turn_id) {
+        print_with_timestamp("[SW] drop_next_turn: only current turn (turn_id=%d) left in history, "
+                             "fall back to unit-level drop\n", earliest_turn);
         return false;
+    }
+
+    // 3) 收集前缀里所有 turn_id == earliest_turn 的非 system unit
+    //    （遇到 turn_id 更大的 unit 就停；system 单独跳过但不打断）
+    int total_len = 0;
+    int n_units   = 0;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        if (e.turn_id != earliest_turn) break;
+        total_len += e.length;
+        n_units++;
     }
 
     if (total_len <= 0 || n_units == 0) {
         // 理论上不会走到这里（turn 内若全是零长度 unit 也没必要丢），保底
-        print_with_timestamp("[SW] drop_next_turn: system has no droppable length (n_units=%d)\n",
-                             n_units);
+        print_with_timestamp("[SW] drop_next_turn: turn_id=%d has no droppable length (n_units=%d)\n",
+                             earliest_turn, n_units);
         return false;
     }
 
     int cache_before = get_cache_length(ctx_omni);
-    for(const auto & length : length_fragments){
-        if (!sliding_window_drop_tokens_from_cache(ctx_omni, length)) {
-            print_with_timestamp("[SW] drop_next_turn_fragments: drop_tokens_from_cache failed "
-                                 "(length=%d)\n", length);
-            return false;
-        }
+    if (!sliding_window_drop_tokens_from_cache(ctx_omni, total_len)) {
+        print_with_timestamp("[SW] drop_next_turn: drop_tokens_from_cache failed "
+                             "(turn_id=%d, total_len=%d)\n", earliest_turn, total_len);
+        return false;
     }
 
     // 4) 从 unit_history 里擦除刚刚丢掉的 n_units 条非 system unit（保留可能混入的 system 条目）
@@ -3761,18 +3748,17 @@ static bool sliding_window_drop_next_turn(struct omni_context * ctx_omni, int le
     for (auto it = ctx_omni->unit_history.begin();
          it != ctx_omni->unit_history.end() && removed < n_units; ) {
         if (it->type == "system") { ++it; continue; }
-        if (turn_ids.find(it->turn_id)!=turn_ids.end()) break;  // 防御性：不该跨 turn
+        if (it->turn_id != earliest_turn) break;  // 防御性：不该跨 turn
         it = ctx_omni->unit_history.erase(it);
         removed++;
     }
 
     int cache_after = get_cache_length(ctx_omni);
-    print_with_timestamp("[SW] 🗑️ DROPPED: %d units, %d tokens | cache %d -> %d, "
+    print_with_timestamp("[SW] 🗑️ DROPPED turn_id=%d: %d units, %d tokens | cache %d -> %d, "
                          "remaining_units=%zu, current_turn_id=%d\n",
-                         n_units, total_len,
+                         earliest_turn, n_units, total_len,
                          cache_before, cache_after,
                          ctx_omni->unit_history.size(), ctx_omni->current_turn_id);
-    ctx_omni->total_dropped_turns     += turn_ids.size();     // 仅 turn 模式 > 0
     return true;
 }
 
@@ -3856,8 +3842,7 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
             //   - 兜底：当 unit_history 里只剩下当前还没收尾的 turn（drop_next_turn 返回 false）
             //     时退化到按 unit 丢，避免"一轮超长、整 turn 又丢不动"把长对话卡死。
             int units_before = (int)ctx_omni->unit_history.size();
-            int length_to_be_deleted = units_before - cfg.low_water_tokens;
-            if (sliding_window_drop_next_turn(ctx_omni, length_to_be_deleted)) {
+            if (sliding_window_drop_next_turn(ctx_omni)) {
                 dropped_turns++;
                 dropped_units += units_before - (int)ctx_omni->unit_history.size();
                 dropped_one = true;
@@ -3890,6 +3875,7 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
         ctx_omni->sliding_event_count++;
         ctx_omni->total_dropped_tokens    += cache_len_before - cache_len;
         ctx_omni->total_dropped_units     += dropped_units;     // 两种模式语义统一：被移除的 UnitEntry 总数
+        ctx_omni->total_dropped_turns     += dropped_turns;     // 仅 turn 模式 > 0
         ctx_omni->total_unit_fallbacks    += unit_fallbacks;    // 仅 turn 模式 > 0
 
         // 一致性检查
@@ -3959,6 +3945,7 @@ struct DuplexPrefillPacket {
     std::vector<std::vector<float>> vision_embed;  // [0]=overview, [1..]=slices
     std::vector<float>              audio_embed;
     int                             index = 0;
+    DuplexChunkTimings              timings;
 };
 
 
@@ -4002,7 +3989,6 @@ struct DuplexPipeline {
     std::condition_variable decode_post_cv;
     std::condition_variable llmout_done_cv;
     std::atomic<int> in_flight_decode{0};
-
 
     DuplexDecodeReq * pending_decode = nullptr;
     std::condition_variable decode_done_cv;
@@ -4412,12 +4398,19 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
+            // OMNI_T2M_DEVICE overrides the platform default below, mirroring
+            // what OMNI_VOC_DEVICE does for the vocoder a few lines down.
+            const char * t2m_dev_env = getenv("OMNI_T2M_DEVICE");
 #ifdef GGML_USE_CANN
-            std::string device_token2mel = "cpu";
-            print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，flow_matching暂用CPU\n");
+            std::string device_token2mel = token2wav_device;
+            print_with_timestamp("Token2Wav: CANN detected, flow_matching using NPU (%s)\n", device_token2mel.c_str());
 #else
             std::string device_token2mel = token2wav_device;
 #endif
+            if (t2m_dev_env && t2m_dev_env[0]) {
+                device_token2mel = t2m_dev_env;
+                print_with_timestamp("Token2Wav: flow_matching device overridden by OMNI_T2M_DEVICE=%s\n", t2m_dev_env);
+            }
 
             // Vocoder 设备策略：
             //   CUDA: vocoder 跟随 token2wav_device（GPU），因为 CUDA kernel launch 开销低
@@ -4430,15 +4423,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 device_vocoder = voc_dev_env;
                 print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n", voc_dev_env);
             } else {
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA)
                 device_vocoder = token2wav_device;
                 print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
 #elif defined(GGML_USE_CANN)
-                device_vocoder = "cpu";
-                print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，vocoder暂用CPU\n");
+                device_vocoder = token2wav_device;
+                print_with_timestamp("Token2Wav: CANN detected, vocoder using NPU (%s)\n", device_vocoder.c_str());
 #else
                 device_vocoder = "cpu";
-                print_with_timestamp("Token2Wav: non-CUDA backend, vocoder using CPU for better performance\n");
+                print_with_timestamp("Token2Wav: no GPU backend, vocoder using CPU for better performance\n");
 #endif
             }
 
@@ -4847,7 +4840,6 @@ void omni_free(struct omni_context * ctx_omni) {
             ctx_omni->tts_thread_info->record_cv.notify_all(); // Wake up the thread if it's waiting
             ctx_omni->tts_record_thread.join(); // Wait for the thread to finish
         }
-
 
         // Stop T2W thread
         t2w_thread_running = false; // Signal the thread to stop
@@ -5348,6 +5340,50 @@ static void filter_special_tokens(
     }
 }
 
+// Append one JSON line to output_<port>/stage_timing.jsonl (async TTS/t2w metrics).
+static void append_stage_timing_jsonl(struct omni_context * ctx_omni, const char * line) {
+    if (!ctx_omni || ctx_omni->base_output_dir.empty() || line == nullptr) {
+        return;
+    }
+    const std::string path = ctx_omni->base_output_dir + "/stage_timing.jsonl";
+    FILE * f = fopen(path.c_str(), "a");
+    if (!f) {
+        return;
+    }
+    fputs(line, f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// Wall-clock TTS codec time for one generate_audio_tokens_* call.
+struct OmniTtsStageTimer {
+    struct omni_context * ctx_omni = nullptr;
+    int chunk_idx = 0;
+    std::chrono::high_resolution_clock::time_point t0;
+
+    OmniTtsStageTimer(struct omni_context * ctx, int idx)
+        : ctx_omni(ctx), chunk_idx(idx), t0(std::chrono::high_resolution_clock::now()) {}
+
+    ~OmniTtsStageTimer() {
+        if (!ctx_omni) {
+            return;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        ctx_omni->speak_tts_ms_acc += ms;
+        char buf[320];
+        // src_cnt：本次 TTS 属于哪一帧。duplex 下 simplex_round_idx 在每帧 decode 开始时
+        // 同步为该帧编号，而 TTS 紧跟 decode 执行（tts_queue 容量为 1，LLM 会阻塞等待），
+        // 所以这里读到的就是源帧。下游据此把 tts 耗时归到 frame 上算每包 RTF。
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"tts\",\"chunk_idx\":%d,\"src_cnt\":%d,\"tts_ms\":%.3f,"
+            "\"speak_tts_acc_ms\":%.3f}",
+            chunk_idx, ctx_omni->simplex_round_idx, ms, ctx_omni->speak_tts_ms_acc);
+        append_stage_timing_jsonl(ctx_omni, buf);
+        print_with_timestamp("[prof] tts chunk=%d ms=%.1f\n", chunk_idx, ms);
+    }
+};
+
 // ==============================================================================
 // 单工版本的 TTS Audio Token Generation
 // 直接从 omni_sinplex.cpp 复制，保证单工模式行为完全一致
@@ -5387,6 +5423,8 @@ static bool generate_audio_tokens_local_simplex(
                 merged_embeddings.size(), n_tokens, tts_n_embd);
         return false;
     }
+
+    OmniTtsStageTimer tts_stage_timer(ctx_omni, chunk_idx);
 
     // 🔧 [修复] 在 prefill 之前动态添加 audio_bos embedding
     // Python 中 audio_bos 是在 TTS 类内部（TTSStreamingGenerator.generate_with_buffer）添加的
@@ -5804,6 +5842,8 @@ static bool generate_audio_tokens_local(
                 merged_embeddings.size(), n_tokens, tts_n_embd);
         return false;
     }
+
+    OmniTtsStageTimer tts_stage_timer(ctx_omni, chunk_idx);
 
     // 🔧 [修复] 在 prefill 之前动态添加 text_eos_embed（如果是轮次结束）和 audio_bos embedding
     // Python TTSStreamingGenerator.generate_with_buffer 逻辑：
@@ -6301,7 +6341,115 @@ static void merge_wav_files(const std::string& output_dir, int num_chunks) {
 // 2. TTS KV cache 跨 chunk 保持（由 is_end_of_turn 控制是否重置）
 // 3. 使用 generate_audio_tokens_local（双工版本，max_audio_tokens=26）
 // ==============================================================================
-/*
+void tts_record_func_duplex(struct omni_context * ctx_omni, common_params *params) {
+    auto& queue = ctx_omni->tts_thread_info->record_queue;
+
+    while(tts_thread_running || !queue.empty()) {
+        // 🔧 [双工模式] 保存 LLM debug 数据（追加模式，统一放在 llm_debug 目录）
+        // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
+        {
+            TTSRecord* ttsRecord = nullptr;
+
+            {
+                std::unique_lock<std::mutex> lk(ctx_omni->tts_thread_info->record_mtx);
+                ctx_omni->tts_thread_info->record_cv.wait(lk, [&]{
+                    return !queue.empty() || !tts_thread_running;
+                });
+                if (queue.empty() && !tts_thread_running) break;
+
+                ttsRecord = queue.front();
+                queue.pop();
+
+            }
+
+            // 1. Save LLM text output (追加模式，只记录纯文本，不记录 special tokens)
+            {
+
+                merge_wav_files(ttsRecord->tts_wav_output_dir, ttsRecord->chunk_idx + 1);
+
+                // 从 llm_text 中过滤掉 special tokens
+                std::string clean_text = std::move(ttsRecord->clean_text);
+                // 移除所有 [[XXX]] 格式的 special token 标记
+
+                size_t pos = 0;
+                while ((pos = clean_text.find("[[")) != std::string::npos) {
+                    size_t end_pos = clean_text.find("]]", pos);
+                    if (end_pos != std::string::npos) {
+                        clean_text.erase(pos, end_pos - pos + 2);
+                    } else {
+                        break;
+                    }
+                }
+                // 移除多余的空格
+                while (clean_text.find("  ") != std::string::npos) {
+                    size_t space_pos = clean_text.find("  ");
+                    clean_text.erase(space_pos, 1);
+                }
+                // 去除首尾空格
+                while (!clean_text.empty() && clean_text[0] == ' ') clean_text.erase(0, 1);
+                while (!clean_text.empty() && clean_text.back() == ' ') clean_text.pop_back();
+
+                // 只有非空文本才记录
+                if (!clean_text.empty()) {
+                    std::string text_file = ttsRecord->llm_debug_output_dir + "/llm_text.txt";
+                    FILE *f_text = fopen(text_file.c_str(), "a");
+                    if (f_text) {
+                        fprintf(f_text, "%s\n", clean_text.c_str());
+                        fclose(f_text);
+                    }
+                }
+
+
+                // 2. Save LLM token IDs (追加模式)
+                std::string token_ids_file = ttsRecord->llm_debug_output_dir + "/llm_token_ids.txt";
+                FILE *f_tokens = fopen(token_ids_file.c_str(), "a");
+                if (f_tokens) {
+                    fprintf(f_tokens, "[chunk_%d] ", ttsRecord->current_chunk_idx);
+                    for (size_t i = 0; i < ttsRecord->current_chunk_token_ids.size(); ++i) {
+                        fprintf(f_tokens, "%d", ttsRecord->current_chunk_token_ids[i]);
+                        if (i < ttsRecord->current_chunk_token_ids.size() - 1) fprintf(f_tokens, " ");
+                    }
+                    fprintf(f_tokens, "\n");
+                    fclose(f_tokens);
+                }
+
+                // 3. Save LLM hidden states (追加模式，文本格式)
+                int n_tokens_orig = (int)(ttsRecord->current_chunk_hidden_states.size() / ttsRecord->current_chunk_n_embd);
+                std::string hidden_txt_file = ttsRecord->llm_debug_output_dir + "/llm_hidden_states.txt";
+                FILE *f_hidden_txt = fopen(hidden_txt_file.c_str(), "a");
+                if (f_hidden_txt) {
+                    fprintf(f_hidden_txt, "[chunk_%d] Hidden States (shape: [%d, %d]):\n", ttsRecord->current_chunk_idx, n_tokens_orig, ttsRecord->current_chunk_n_embd);
+                    for (int i = 0; i < n_tokens_orig; ++i) {
+                        fprintf(f_hidden_txt, "  Token %d: %.6f %.6f %.6f ... (first 3 values)\n", i,
+                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 0],
+                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 1],
+                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 2]);
+                    }
+                    fclose(f_hidden_txt);
+                }
+
+                // 4. Save merged embeddings (追加模式) if successfully computed
+                if (ttsRecord->merged_success && !ttsRecord->merged_embeddings.empty()) {
+                    std::string merged_txt_file = ttsRecord->llm_debug_output_dir + "/ttsRecord->merged_embeddings.txt";
+                    FILE *f_merged_txt = fopen(merged_txt_file.c_str(), "a");
+                    if (f_merged_txt) {
+                        fprintf(f_merged_txt, "[chunk_%d] Merged Embeddings (shape: [%d, %d]):\n", ttsRecord->current_chunk_idx, ttsRecord->n_tokens_filtered, ttsRecord->tts_n_embd);
+                        for (int i = 0; i < ttsRecord->n_tokens_filtered; ++i) {
+                            fprintf(f_merged_txt, "  Token %d: %.6f %.6f %.6f ... (first 3 values)\n", i,
+                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 0],
+                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 1],
+                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 2]);
+                        }
+                        fclose(f_merged_txt);
+                    }
+                }
+                delete ttsRecord;
+            }
+        }
+    }
+
+    print_with_timestamp("Duplex: tts_record_thread stopped\n");
+}
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
     int tts_n_past = 0;
@@ -6919,118 +7067,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
 
     print_with_timestamp("TTS thread (duplex mode) stopped\n");
 }
-*/
-
-void tts_record_func_duplex(struct omni_context * ctx_omni, common_params *params) {
-    auto& queue = ctx_omni->tts_thread_info->record_queue;
-
-    while(tts_thread_running || !queue.empty()) {
-        // 🔧 [双工模式] 保存 LLM debug 数据（追加模式，统一放在 llm_debug 目录）
-        // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
-        {
-            TTSRecord* ttsRecord = nullptr;
-
-            {
-                std::unique_lock<std::mutex> lk(ctx_omni->tts_thread_info->record_mtx);
-                ctx_omni->tts_thread_info->record_cv.wait(lk, [&]{
-                    return !queue.empty() || !tts_thread_running;
-                });
-                if (queue.empty() && !tts_thread_running) break;
-
-                ttsRecord = queue.front();
-                queue.pop();
-
-            }
-
-            // 1. Save LLM text output (追加模式，只记录纯文本，不记录 special tokens)
-            {
-
-                merge_wav_files(ttsRecord->tts_wav_output_dir, ttsRecord->chunk_idx + 1);
-
-                // 从 llm_text 中过滤掉 special tokens
-                std::string clean_text = std::move(ttsRecord->clean_text);
-                // 移除所有 [[XXX]] 格式的 special token 标记
-
-                size_t pos = 0;
-                while ((pos = clean_text.find("[[")) != std::string::npos) {
-                    size_t end_pos = clean_text.find("]]", pos);
-                    if (end_pos != std::string::npos) {
-                        clean_text.erase(pos, end_pos - pos + 2);
-                    } else {
-                        break;
-                    }
-                }
-                // 移除多余的空格
-                while (clean_text.find("  ") != std::string::npos) {
-                    size_t space_pos = clean_text.find("  ");
-                    clean_text.erase(space_pos, 1);
-                }
-                // 去除首尾空格
-                while (!clean_text.empty() && clean_text[0] == ' ') clean_text.erase(0, 1);
-                while (!clean_text.empty() && clean_text.back() == ' ') clean_text.pop_back();
-
-                // 只有非空文本才记录
-                if (!clean_text.empty()) {
-                    std::string text_file = ttsRecord->llm_debug_output_dir + "/llm_text.txt";
-                    FILE *f_text = fopen(text_file.c_str(), "a");
-                    if (f_text) {
-                        fprintf(f_text, "%s\n", clean_text.c_str());
-                        fclose(f_text);
-                    }
-                }
-
-
-                // 2. Save LLM token IDs (追加模式)
-                std::string token_ids_file = ttsRecord->llm_debug_output_dir + "/llm_token_ids.txt";
-                FILE *f_tokens = fopen(token_ids_file.c_str(), "a");
-                if (f_tokens) {
-                    fprintf(f_tokens, "[chunk_%d] ", ttsRecord->current_chunk_idx);
-                    for (size_t i = 0; i < ttsRecord->current_chunk_token_ids.size(); ++i) {
-                        fprintf(f_tokens, "%d", ttsRecord->current_chunk_token_ids[i]);
-                        if (i < ttsRecord->current_chunk_token_ids.size() - 1) fprintf(f_tokens, " ");
-                    }
-                    fprintf(f_tokens, "\n");
-                    fclose(f_tokens);
-                }
-
-                // 3. Save LLM hidden states (追加模式，文本格式)
-                int n_tokens_orig = (int)(ttsRecord->current_chunk_hidden_states.size() / ttsRecord->current_chunk_n_embd);
-                std::string hidden_txt_file = ttsRecord->llm_debug_output_dir + "/llm_hidden_states.txt";
-                FILE *f_hidden_txt = fopen(hidden_txt_file.c_str(), "a");
-                if (f_hidden_txt) {
-                    fprintf(f_hidden_txt, "[chunk_%d] Hidden States (shape: [%d, %d]):\n", ttsRecord->current_chunk_idx, n_tokens_orig, ttsRecord->current_chunk_n_embd);
-                    for (int i = 0; i < n_tokens_orig; ++i) {
-                        fprintf(f_hidden_txt, "  Token %d: %.6f %.6f %.6f ... (first 3 values)\n", i,
-                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 0],
-                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 1],
-                                ttsRecord->current_chunk_hidden_states[i * ttsRecord->current_chunk_n_embd + 2]);
-                    }
-                    fclose(f_hidden_txt);
-                }
-
-                // 4. Save merged embeddings (追加模式) if successfully computed
-                if (ttsRecord->merged_success && !ttsRecord->merged_embeddings.empty()) {
-                    std::string merged_txt_file = ttsRecord->llm_debug_output_dir + "/ttsRecord->merged_embeddings.txt";
-                    FILE *f_merged_txt = fopen(merged_txt_file.c_str(), "a");
-                    if (f_merged_txt) {
-                        fprintf(f_merged_txt, "[chunk_%d] Merged Embeddings (shape: [%d, %d]):\n", ttsRecord->current_chunk_idx, ttsRecord->n_tokens_filtered, ttsRecord->tts_n_embd);
-                        for (int i = 0; i < ttsRecord->n_tokens_filtered; ++i) {
-                            fprintf(f_merged_txt, "  Token %d: %.6f %.6f %.6f ... (first 3 values)\n", i,
-                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 0],
-                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 1],
-                                    ttsRecord->merged_embeddings[i * ttsRecord->tts_n_embd + 2]);
-                        }
-                        fclose(f_merged_txt);
-                    }
-                }
-                delete ttsRecord;
-            }
-        }
-    }
-
-    print_with_timestamp("Duplex: tts_record_thread stopped\n");
-}
-
+/*
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
     int tts_n_past = 0;
@@ -7412,6 +7449,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 }
             }
 
+
             // Generate audio tokens using duplex version
             // 🔧 [修复尾音问题] 当 is_end_of_turn=true 时，即使 merged_embeddings 为空，
             // 也要调用 TTS 生成（只添加 text_eos_embed），让 TTS flush 它的 buffer
@@ -7588,7 +7626,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     }
 
     print_with_timestamp("TTS thread (duplex mode) stopped\n");
-}
+}*/
 
 void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
@@ -9767,6 +9805,15 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         // 现在 T2WOut.round_idx 保存的是递增前的值，确保 WAV 写入正确的目录
         int effective_round_idx = (received_round_idx >= 0) ? received_round_idx : ctx_omni->simplex_round_idx;
 
+        // 🔧 [wav 溯源] wav 编号基数必须用 *入队时* 捕获的轮次，而不是写盘时刻去读
+        // ctx_omni->wav_turn_base —— 后者由 LLM 线程在每帧 decode 开始时改写
+        // (duplex_do_decode 里的 "sync round_idx")，一旦 TTS/T2W 慢过一个进帧间隔，
+        // wav 就会被贴上下一帧的编号，评测再也无法把 wav 归回产生它的 frame。
+        // T2WOut.round_idx 是 TTS 线程 push 时记下的，正是我们要的那个帧号。
+        const int wav_base = ctx_omni->duplex_mode
+                                 ? (effective_round_idx * 1000)
+                                 : ctx_omni->wav_turn_base;
+
         if (!ctx_omni->duplex_mode && effective_round_idx != last_round_idx) {
             print_with_timestamp("T2W线程(C++): 轮次切换 (%d -> %d)，更新输出目录\n",
                                 last_round_idx, effective_round_idx);
@@ -9783,6 +9830,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             wav_idx = 0;                                                    // WAV 文件编号从 0 开始
             ctx_omni->wav_turn_base = effective_round_idx * 1000;           // 更新全局 WAV 编号基数
             token_buffer = {4218, 4218, 4218};                              // 重置 token buffer（3个静音前缀）
+            ctx_omni->speak_t2w_ms_acc = 0.0;
+            ctx_omni->speak_tts_ms_acc = 0.0;
 
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
 
@@ -9857,7 +9906,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     }
 
                     // Write WAV file
-                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(wav_base + wav_idx) + ".wav";
 
                     const int16_t num_channels = 1;
                     const int16_t bits_per_sample = 16;
@@ -9906,7 +9955,25 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                             print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
                         }
                         print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms | queue_wait=%.1fms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
+                                            wav_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
+                        {
+                            ctx_omni->speak_t2w_ms_acc += t2w_ms;
+                            char buf[640];
+                            const int wav_id = wav_base + wav_idx;
+                            // src_cnt / n_samples / duration_ms 让下游能直接算每包 RTF，
+                            // 不必再去读 wav 文件、也不必靠 poll 时刻猜这个 wav 属于哪一帧。
+                            // tts_ms lives on event=tts from OmniTtsStageTimer; do not use queue_wait as TTS.
+                            snprintf(buf, sizeof(buf),
+                                "{\"event\":\"t2w\",\"wav\":\"wav_%d.wav\",\"src_cnt\":%d,"
+                                "\"n_samples\":%d,\"sample_rate\":%d,\"duration_ms\":%.3f,"
+                                "\"is_final\":%s,\"token2wav_ms\":%.3f,"
+                                "\"t2w_queue_wait_ms\":%.3f,\"speak_t2w_acc_ms\":%.3f}",
+                                wav_id, effective_round_idx,
+                                (int)chunk_wav.size(), sample_rate, audio_duration * 1000.0,
+                                is_last_window ? "true" : "false", t2w_ms,
+                                queue_wait_ms, ctx_omni->speak_t2w_ms_acc);
+                            append_stage_timing_jsonl(ctx_omni, buf);
+                        }
                         wav_idx++;
                     }
                 }
@@ -9962,7 +10029,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         FILE* flag_file = fopen(done_flag_path.c_str(), "w");
                         if (flag_file) {
                             // 写入最后一个 wav 的编号（wav_idx - 1，因为 wav_idx 已经指向下一个）
-                            int last_wav_idx = (wav_idx > 0) ? (ctx_omni->wav_turn_base + wav_idx - 1) : 0;
+                            int last_wav_idx = (wav_idx > 0) ? (wav_base + wav_idx - 1) : 0;
                             fprintf(flag_file, "%d\n", last_wav_idx);
                             fclose(flag_file);
                             print_with_timestamp("T2W线程: 写入结束标记 %s (last_wav=%d)\n", done_flag_path.c_str(), last_wav_idx);
@@ -10162,6 +10229,8 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
 
         DuplexPrefillPacket * packet = new DuplexPrefillPacket();
         packet->index = req->index;
+        packet->timings.index = req->index;
+        packet->index = req->index;
 
         const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
         const bool has_aud = !req->aud_fname.empty();
@@ -10230,6 +10299,9 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             "[prof] encoder index=%d VPM=%.1fms APM=%.1fms wall=%.1fms parallel_savings=%.1fms\n",
             req->index, vpm_ms, apm_ms, enc_wall_ms,
             (vpm_ms + apm_ms) - enc_wall_ms);
+
+        packet->timings.vpm_ms = vpm_ms;
+        packet->timings.apm_ms = apm_ms;
 
         delete req;
 
@@ -10497,6 +10569,7 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
         "[prof] llm prefill (fused) n_past=%d->%d tokens=%d ms=%.1f\n",
         n_past_0, ctx_omni->n_past,
         ctx_omni->n_past - n_past_0, ms);
+    packet->timings.llm_prefill_ms = ms;
     return true;
 }
 
@@ -10575,6 +10648,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
         "[prof] llm prefill n_past=%d->%d tokens=%d ms=%.1f\n",
         n_past_0, ctx_omni->n_past,
         ctx_omni->n_past - n_past_0, ms);
+    packet->timings.llm_prefill_ms = ms;
 }
 
 // ---------------------------------------------------------------------------
@@ -10584,286 +10658,11 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 // 因为新路径下 ctx_llama 已由 llm 线程独占。
 // 返回 false 表示内部异常或被 break 打断。
 // ---------------------------------------------------------------------------
-/*
-static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
-                             const std::string & debug_dir, int round_idx) {
-    // ---- 轮次同步（与老 stream_decode 对齐） ----
-    if (round_idx >= 0) {
-        if (ctx_omni->simplex_round_idx != round_idx) {
-            print_with_timestamp("Duplex decode: sync round_idx %d -> %d\n",
-                                 ctx_omni->simplex_round_idx, round_idx);
-            ctx_omni->simplex_round_idx = round_idx;
-            ctx_omni->wav_turn_base     = round_idx * 1000;
-        }
-    }
-
-    ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
-    auto t_dec_begin = ctx_omni->stream_decode_start_time;
-    int  n_past_dec_0 = ctx_omni->n_past;
-
-    print_with_timestamp("Duplex decode: start, n_past=%d, n_keep=%d, n_ctx=%d\n",
-                         ctx_omni->n_past, ctx_omni->n_keep, params->n_ctx);
-
-    // duplex 下 llm_generation_done 不重置（与老路径对齐）
-    ctx_omni->ended_with_listen = false;
-
-    if (ctx_omni->break_event.load()) {
-        ctx_omni->break_event.store(false);
-        print_with_timestamp("Duplex decode: reset break_event at start\n");
-    }
-
-    // 清空上一轮 text 残留
-    {
-        std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
-        ctx_omni->text_queue.clear();
-        ctx_omni->text_done_flag  = false;
-        ctx_omni->text_streaming  = true;
-    }
-
-    if (ctx_omni->use_tts) {
-        ctx_omni->speek_done = false;
-    }
-
-    // decode 开始时的 cache 长度（prefill 已完成写入，这里取值才准确）
-    int decode_start_cache_len = ctx_omni->n_past;
-
-    // ---- force_listen：会话开局强制 LISTEN N 次 ----
-    if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
-        ctx_omni->force_listen_used++;
-        ctx_omni->slide_last_was_listen = true;
-        ctx_omni->ended_with_listen     = true;
-        ctx_omni->current_turn_ended    = false;
-        if (ctx_omni->use_tts) {
-            ctx_omni->speek_done = true;
-        }
-        print_with_timestamp("Duplex decode: force_listen %d/%d, emit __IS_LISTEN__\n",
-                             ctx_omni->force_listen_used, ctx_omni->force_listen_count);
-        {
-            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-            ctx_omni->text_queue.push_back("__IS_LISTEN__");
-            ctx_omni->text_done_flag = true;
-            ctx_omni->text_streaming = false;
-            ctx_omni->text_cv.notify_all();
-        }
-        return true;
-    }
-
-    // ---- 采样主循环（搬自老 stream_decode duplex 分支） ----
-    const int max_tgt_len = params->n_predict < 0 ? params->n_ctx : params->n_predict;
-    const int step_size   = 10;   // chunk 推送给 TTS 的 LLM token 数量
-    bool llm_finish                  = false;
-    bool local_is_end_of_turn        = false;
-    int  current_chunk_tokens        = 0;
-    const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
-    bool chunk_limit_reached         = false;
-    const int llm_n_embd             = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-
-    std::string response;
-    for (int il = 0; il < max_tgt_len; ) {
-        if (ctx_omni->break_event.load()) {
-            llm_finish = true;
-            break;
-        }
-
-        response.clear();
-        int jl = 0;
-        int total_tokens_generated = 0;
-        std::vector<llama_token> chunk_token_ids;
-        std::vector<float>       chunk_hidden_states;
-        local_is_end_of_turn     = false;
-
-        while (jl < step_size && !llm_finish
-               && !ctx_omni->break_event.load()
-               && !chunk_limit_reached)
-        {
-            const char * tmp = nullptr;
-            float *      hidden_states = nullptr;
-            llama_token  sampled_token = 0;
-
-            tmp = llama_loop_with_hidden_and_token(
-                ctx_omni, params, ctx_omni->ctx_sampler,
-                ctx_omni->n_past, hidden_states, sampled_token);
-
-            total_tokens_generated++;
-
-            if (tmp != nullptr && hidden_states != nullptr
-                && is_valid_tts_token(sampled_token)) {
-                chunk_token_ids.push_back(sampled_token);
-                chunk_hidden_states.insert(chunk_hidden_states.end(),
-                                           hidden_states, hidden_states + llm_n_embd);
-                jl++;
-                current_chunk_tokens++;
-                if (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens) {
-                    chunk_limit_reached = true;
-                }
-            }
-
-            if (tmp == nullptr) {
-                LOG_ERR("Duplex decode: llama_loop returned nullptr\n");
-                break;
-            }
-
-            OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
-
-            if (token_type == OmniTokenType::TURN_EOS
-                || token_type == OmniTokenType::TTS_EOS
-                || token_type == OmniTokenType::EOS) {
-                local_is_end_of_turn           = true;
-                ctx_omni->current_turn_ended   = true;
-                print_with_timestamp("Duplex decode: turn_eos (type=%d), wait for chunk_eos\n",
-                                     (int)token_type);
-            } else if (token_type == OmniTokenType::LISTEN) {
-                if (!ctx_omni->slide_last_was_listen.load()) {
-                    local_is_end_of_turn = true;
-                    print_with_timestamp("Duplex decode: LISTEN after SPEAK, flush TTS\n");
-                }
-            }
-
-            if (is_end_token(ctx_omni, sampled_token)) {
-                llm_finish = true;
-
-                if (token_type == OmniTokenType::TURN_EOS
-                    || token_type == OmniTokenType::TTS_EOS
-                    || token_type == OmniTokenType::EOS) {
-                    ctx_omni->current_turn_ended = true;
-                }
-
-                if (token_type == OmniTokenType::LISTEN) {
-                    ctx_omni->ended_with_listen     = true;
-                    ctx_omni->slide_last_was_listen = true;
-                    {
-                        std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-                        ctx_omni->text_queue.push_back("__IS_LISTEN__");
-                        ctx_omni->text_cv.notify_all();
-                    }
-                } else {
-                    ctx_omni->slide_last_was_listen = false;
-                }
-                break;  // 不把结束 token 加入 response
-            }
-
-            response += std::string(tmp);
-        }
-
-        // chunk 限制：强制补 <|chunk_eos|> token 结束本轮
-        if (chunk_limit_reached) {
-            if (ctx_omni->special_token_chunk_eos >= 0) {
-                std::vector<llama_token> t = {ctx_omni->special_token_chunk_eos};
-                eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past);
-            }
-            llm_finish            = true;
-            current_chunk_tokens  = 0;
-        }
-
-        // duplex chunk 末尾写入 </unit>
-        if (ctx_omni->special_token_unit_end >= 0) {
-            std::vector<llama_token> t = {ctx_omni->special_token_unit_end};
-            eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past);
-        }
-
-        il += total_tokens_generated;
-
-        // 清理 response 中的特殊结束 token
-        {
-            static const std::vector<std::string> end_tokens = {
-                "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
-                "<|chunk_eos|>", "<|chunk_tts_eos|>"
-            };
-            for (const auto & t : end_tokens) {
-                size_t p = response.find(t);
-                if (p != std::string::npos) response = response.substr(0, p);
-            }
-            size_t speak_pos = response.find("<|speak|>");
-            while (speak_pos != std::string::npos) {
-                response.erase(speak_pos, std::string("<|speak|>").length());
-                speak_pos = response.find("<|speak|>");
-            }
-        }
-
-        // 推送到 text_queue（SSE）
-        if (!response.empty()) {
-            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-            ctx_omni->text_queue.push_back(response);
-            ctx_omni->text_cv.notify_all();
-        }
-
-        // 推送到 TTS queue
-        if (ctx_omni->use_tts && ctx_omni->tts_thread_info
-            && (!response.empty() || llm_finish))
-        {
-            LLMOut * llm_out = new LLMOut();
-            llm_out->text            = response;
-            llm_out->n_past          = ctx_omni->n_past;
-            llm_out->llm_finish      = llm_finish;
-            llm_out->debug_dir       = debug_dir;
-            llm_out->token_ids       = chunk_token_ids;
-            llm_out->hidden_states   = chunk_hidden_states;
-            llm_out->n_embd          = llm_n_embd;
-            llm_out->is_end_of_turn  = local_is_end_of_turn;
-
-            {
-                std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
-                ctx_omni->tts_thread_info->cv.wait(lock, [&]{
-                    return ctx_omni->tts_thread_info->queue.size()
-                           < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
-                });
-                // duplex 模式下无论 speek_done 都推送（与老 L9796 一致）
-                ctx_omni->tts_thread_info->queue.push(llm_out);
-            }
-            ctx_omni->tts_thread_info->cv.notify_all();
-        }
-
-        if (llm_finish) break;
-    }
-
-    // ---- 推送轮次结束标记 ----
-    {
-        std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-        if (!ctx_omni->ended_with_listen) {
-            ctx_omni->text_queue.push_back("__END_OF_TURN__");
-        }
-        ctx_omni->text_done_flag = true;
-        ctx_omni->text_cv.notify_all();
-        ctx_omni->text_streaming = false;
-    }
-
-    // ---- response unit 注册 ----
-    if (ctx_omni->sliding_window_config.mode != "off") {
-        int response_len = ctx_omni->n_past - decode_start_cache_len;
-        if (response_len > 0) {
-            UnitEntry entry;
-            entry.unit_id   = ctx_omni->next_unit_id++;
-            entry.length    = response_len;
-            entry.type      = "response";
-            entry.is_listen = ctx_omni->ended_with_listen.load();
-            entry.turn_id   = ctx_omni->current_turn_id;
-            ctx_omni->unit_history.push_back(entry);
-            print_with_timestamp(
-                "[SW] duplex register response unit: unit_id=%d len=%d is_listen=%d turn_id=%d\n",
-                entry.unit_id, entry.length, (int)entry.is_listen, entry.turn_id);
-        }
-    }
-
-    // ---- round boundary（duplex 下仅在 LISTEN 结束时记录） ----
-    if (ctx_omni->ended_with_listen) {
-        ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
-        print_with_timestamp("Duplex decode: round boundary at n_past=%d, total=%zu\n",
-                             ctx_omni->n_past, ctx_omni->round_start_positions.size());
-        ctx_omni->current_turn_id++;
-    }
-
-    auto t_dec_end = std::chrono::high_resolution_clock::now();
-    double dec_ms = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_begin).count();
-    print_with_timestamp(
-        "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
-        n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - n_past_dec_0,
-        dec_ms, (int)ctx_omni->ended_with_listen.load());
-    return true;
-}
-*/
-
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, DuplexDecodeReq * decode_req) {
     int round_idx = decode_req->round_idx;
+    // ---- 轮次同步 ----
+    // 正常情况下帧号已经由 llm 线程从 prefill packet 的 index 设好了，这里只是给
+    // 显式传 round_idx 的调用方（perf-duplex 传 frame_id）留的覆盖入口。
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
             print_with_timestamp("Duplex decode: sync round_idx %d -> %d\n",
@@ -10872,10 +10671,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
             ctx_omni->wav_turn_base     = round_idx * 1000;
         }
     }
-
-    // ---- 轮次同步（与老 stream_decode 对齐） ----
     DuplexPipeline * dup = ctx_omni->duplex;
-
 
     ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
     auto t_dec_begin = ctx_omni->stream_decode_start_time;
@@ -10886,6 +10682,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
 
     // duplex 下 llm_generation_done 不重置（与老路径对齐）
     ctx_omni->ended_with_listen = false;
+    ctx_omni->duplex_frame_idle = false;
 
     if (ctx_omni->break_event.load()) {
         ctx_omni->break_event.store(false);
@@ -10928,9 +10725,52 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
 
         decode_req->ok.store(true);
 
+        int out_idx = 0;
+        double out_vpm = 0.0, out_apm = 0.0, out_pref = 0.0, out_dec = 0.0;
+        std::string out_dir;
+        {
+            std::lock_guard<std::mutex> lk(ctx_omni->stage_timings_mtx);
+            if (decode_req->have_packet_timings) {
+                ctx_omni->last_chunk_timings.index = decode_req->chunk_timings.index;
+                ctx_omni->last_chunk_timings.vpm_ms = decode_req->chunk_timings.vpm_ms;
+                ctx_omni->last_chunk_timings.apm_ms = decode_req->chunk_timings.apm_ms;
+                ctx_omni->last_chunk_timings.llm_prefill_ms = decode_req->chunk_timings.llm_prefill_ms;
+            } else {
+                ctx_omni->last_chunk_timings.index = 0;
+                ctx_omni->last_chunk_timings.vpm_ms = 0.0;
+                ctx_omni->last_chunk_timings.apm_ms = 0.0;
+                ctx_omni->last_chunk_timings.llm_prefill_ms = 0.0;
+            }
+            ctx_omni->last_chunk_timings.llm_decode_ms = 0;
+            ctx_omni->last_chunk_timings.tts_ms = 0.0;
+            ctx_omni->last_chunk_timings.token2wav_ms = 0.0;
+            ctx_omni->last_chunk_timings.valid = true;
+            out_idx = ctx_omni->last_chunk_timings.index;
+            out_vpm = ctx_omni->last_chunk_timings.vpm_ms;
+            out_apm = ctx_omni->last_chunk_timings.apm_ms;
+            out_pref = ctx_omni->last_chunk_timings.llm_prefill_ms;
+            out_dec = ctx_omni->last_chunk_timings.llm_decode_ms;
+            out_dir = ctx_omni->base_output_dir;
+        }
+        {
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "{\"event\":\"chunk\",\"cnt\":%d,\"vpm_ms\":%.3f,\"apm_ms\":%.3f,"
+                "\"llm_prefill_ms\":%.3f,\"cost_llm_ms\":%.3f}",
+                out_idx, out_vpm, out_apm, out_pref, out_dec);
+            std::string path = out_dir + "/stage_timing.jsonl";
+            FILE * f = fopen(path.c_str(), "a");
+            if (f) {
+                fputs(buf, f);
+                fputc('\n', f);
+                fclose(f);
+            }
+        }
+
         decode_req->done.store(true);
-        decode_req = nullptr;
         dup->decode_done_cv.notify_all();
+
+        //decode_req = nullptr;
         return true;
     }
 
@@ -10943,6 +10783,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
     const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
     bool chunk_limit_reached         = false;
     const int llm_n_embd             = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    // 本帧是否产出过任何有效 TTS token（跨所有 chunk 批次累计）。
+    // IDLE 判据用它，而不是 response 是否为空。
+    bool produced_tts_tokens         = false;
 
     std::string response;
     for (int il = 0; il < max_tgt_len; ) {
@@ -10977,6 +10820,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
                 chunk_token_ids.push_back(sampled_token);
                 chunk_hidden_states.insert(chunk_hidden_states.end(),
                                            hidden_states, hidden_states + llm_n_embd);
+                produced_tts_tokens = true;
                 jl++;
                 current_chunk_tokens++;
                 if (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens) {
@@ -11049,7 +10893,6 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
 
         il += total_tokens_generated;
 
-
         LLMOut * llm_out = new LLMOut();
         llm_out->text            = response;
         llm_out->n_past          = ctx_omni->n_past;
@@ -11063,15 +10906,22 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
         llm_out->n_past_dec_0    = n_past_dec_0;
         llm_out->decode_req      = decode_req;
 
+        const bool frame_idle = !ctx_omni->ended_with_listen.load()
+                                    && !produced_tts_tokens
+                                    && ctx_omni->current_turn_ended;
+        llm_out->frame_idle = frame_idle;
+
         {
             std::lock_guard<std::mutex> lk(dup->decode_post_mtx);
             dup->decode_post_queue.push(llm_out);
             dup->decode_post_cv.notify_all();
         }
 
-        if (llm_finish) break;
+        if (llm_finish){
+            ctx_omni->duplex_frame_idle = frame_idle;
+            break;
+        }
     }
-
     return true;
 }
 
@@ -11080,40 +10930,6 @@ static void duplex_decode_post_func(omni_context * ctx_omni, common_params * par
 
     DuplexDecodeReq * decode_req = nullptr;
 
-    /*
-    std::thread llm_post_thread;
-    std::queue<LLMOut *> decode_post_queue;
-    std::mutex decode_post_mtx;
-    std::condition_variable decode_post_cv;
-    static constexpr size_t DECODE_POST_QUEUE_CAP = 26;
-
-    while (!dup->prefill_queue.empty()) {
-        delete dup->prefill_queue.front();
-        dup->prefill_queue.pop();
-        n_dropped++;
-    }
-
-    struct LLMOut {
-        std::string text;
-        int n_past;
-        bool llm_finish = false;
-        std::string debug_dir;
-        // 添加token IDs和hidden states用于TTS条件生成
-        std::vector<llama_token> token_ids;  // LLM生成的token IDs
-        std::vector<float> hidden_states;   // LLM的hidden states (n_tokens * n_embd)
-        int n_embd = 0;  // hidden states的维度
-
-        // 🔧 [修复双工缺字问题] 该 chunk 是否是 turn 的最后一个 chunk
-        // 此状态随数据一起传递，避免全局状态 current_turn_ended 的时序问题
-        // 只有当 LLM 检测到 TURN_EOS/TTS_EOS/EOS 时才设置为 true
-        bool is_end_of_turn = false;
-    };
-    DuplexPipeline * dup = ctx_omni->duplex;
-    while (!dup->encoder_queue.empty()) {
-        delete dup->encoder_queue.front();
-        dup->encoder_queue.pop();
-    }
-    */
     while (dup->running.load()) {
         std::vector<LLMOut*> batch;
 
@@ -11135,20 +10951,23 @@ static void duplex_decode_post_func(omni_context * ctx_omni, common_params * par
         }
         std::string response = std::move(llm_out->text);
 
-        // 清理 response 中的特殊结束 token
+        // 清理 response 中的控制 token。
+        //
+        // 必须逐个 erase，不能 "截断到第一个控制 token"：<|turn_eos|> 不在
+        // is_end_token 里（duplex 只认 LISTEN/CHUNK_EOS/CHUNK_TTS_EOS），采到它之后
+        // 循环还会继续采样，于是 response 可能长成 "<|speak|><|turn_eos|>二"。
+        // 截断会把后面的 "二" 一起丢掉，而 chunk_token_ids 是在类型判断之前收集的、
+        // 不受影响 —— 结果就是这个字照样进 TTS 合成出音频，文本侧却报空，
+        // 下游按 "空 text" 把这一帧当噪声排除掉。
         {
-            static const std::vector<std::string> end_tokens = {
-                "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
+            static const std::vector<std::string> ctrl_tokens = {
+                "<|speak|>", "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
                 "<|chunk_eos|>", "<|chunk_tts_eos|>"
             };
-            for (const auto & t : end_tokens) {
-                size_t p = response.find(t);
-                if (p != std::string::npos) response = response.substr(0, p);
-            }
-            size_t speak_pos = response.find("<|speak|>");
-            while (speak_pos != std::string::npos) {
-                response.erase(speak_pos, std::string("<|speak|>").length());
-                speak_pos = response.find("<|speak|>");
+            for (const auto & t : ctrl_tokens) {
+                for (size_t p = response.find(t); p != std::string::npos; p = response.find(t, p)) {
+                    response.erase(p, t.length());
+                }
             }
         }
 
@@ -11183,7 +11002,10 @@ static void duplex_decode_post_func(omni_context * ctx_omni, common_params * par
             {
                 std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
                 if (!ctx_omni->ended_with_listen) {
-                    ctx_omni->text_queue.push_back("__END_OF_TURN__");
+                    // __TURN_IDLE__ 是 __END_OF_TURN__ 的一个子类：SSE 侧仍然发
+                    // end_of_turn=true / is_listen=false（老客户端行为不变），只是额外带一个
+                    // turn_idle=true，让评测能把这种帧从 speak 统计里摘出去。
+                    ctx_omni->text_queue.push_back(llm_out->frame_idle ? "__TURN_IDLE__" : "__END_OF_TURN__");
                 }
                 ctx_omni->text_done_flag = true;
                 ctx_omni->text_cv.notify_all();
@@ -11215,12 +11037,7 @@ static void duplex_decode_post_func(omni_context * ctx_omni, common_params * par
                 ctx_omni->current_turn_id++;
             }
 
-            auto t_dec_end = std::chrono::high_resolution_clock::now();
-            double dec_ms = std::chrono::duration<double, std::milli>(t_dec_end - llm_out->t_dec_begin).count();
-            print_with_timestamp(
-                "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
-                llm_out->n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - llm_out->n_past_dec_0,
-                dec_ms, (int)ctx_omni->ended_with_listen.load());
+
 
             if (!ctx_omni->break_event.load()) {
                 llm_out->decode_req->ok.store(true);
@@ -11228,16 +11045,66 @@ static void duplex_decode_post_func(omni_context * ctx_omni, common_params * par
                 llm_out->decode_req->ok.store(false);
             }
 
+            auto t_dec_end = std::chrono::high_resolution_clock::now();
+            double dec_ms = std::chrono::duration<double, std::milli>(t_dec_end - llm_out->t_dec_begin).count();
+            print_with_timestamp(
+                "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
+                llm_out->n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - llm_out->n_past_dec_0,
+                dec_ms, (int)ctx_omni->ended_with_listen.load());
+
+            int out_idx = 0;
+            double out_vpm = 0.0, out_apm = 0.0, out_pref = 0.0, out_dec = 0.0;
+            std::string out_dir;
+            {
+                std::lock_guard<std::mutex> lk(ctx_omni->stage_timings_mtx);
+                if (llm_out->decode_req->have_packet_timings) {
+                    ctx_omni->last_chunk_timings.index = llm_out->decode_req->chunk_timings.index;
+                    ctx_omni->last_chunk_timings.vpm_ms = llm_out->decode_req->chunk_timings.vpm_ms;
+                    ctx_omni->last_chunk_timings.apm_ms = llm_out->decode_req->chunk_timings.apm_ms;
+                    ctx_omni->last_chunk_timings.llm_prefill_ms = llm_out->decode_req->chunk_timings.llm_prefill_ms;
+                } else {
+                    ctx_omni->last_chunk_timings.index = 0;
+                    ctx_omni->last_chunk_timings.vpm_ms = 0.0;
+                    ctx_omni->last_chunk_timings.apm_ms = 0.0;
+                    ctx_omni->last_chunk_timings.llm_prefill_ms = 0.0;
+                }
+                ctx_omni->last_chunk_timings.llm_decode_ms = dec_ms;
+                ctx_omni->last_chunk_timings.tts_ms = 0.0;
+                ctx_omni->last_chunk_timings.token2wav_ms = 0.0;
+                ctx_omni->last_chunk_timings.valid = true;
+                out_idx = ctx_omni->last_chunk_timings.index;
+                out_vpm = ctx_omni->last_chunk_timings.vpm_ms;
+                out_apm = ctx_omni->last_chunk_timings.apm_ms;
+                out_pref = ctx_omni->last_chunk_timings.llm_prefill_ms;
+                out_dec = ctx_omni->last_chunk_timings.llm_decode_ms;
+                out_dir = ctx_omni->base_output_dir;
+            }
+
             llm_out->decode_req->done.store(true);
-            llm_out->decode_req = nullptr;
             dup->decode_done_cv.notify_all();
+
+            {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "{\"event\":\"chunk\",\"cnt\":%d,\"vpm_ms\":%.3f,\"apm_ms\":%.3f,"
+                    "\"llm_prefill_ms\":%.3f,\"cost_llm_ms\":%.3f}",
+                    out_idx, out_vpm, out_apm, out_pref, out_dec);
+                std::string path = out_dir + "/stage_timing.jsonl";
+                FILE * f = fopen(path.c_str(), "a");
+                if (f) {
+                    fputs(buf, f);
+                    fputc('\n', f);
+                    fclose(f);
+                }
+            }
+
+            llm_out->decode_req = nullptr;
         }
 
         if (!(ctx_omni->use_tts && ctx_omni->tts_thread_info
             && (!response.empty() || llm_out->llm_finish))){
             delete llm_out;
         }
-
     }
 
     std::lock_guard<std::mutex> lk(dup->decode_post_mtx);
@@ -11302,6 +11169,7 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
                     dup->pending_decode = nullptr;
                     dup->decode_done_cv.notify_all();
                 }
+                lk.unlock();
                 dup->llm_cv.notify_all();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
@@ -11311,7 +11179,7 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->pending_decode = nullptr;
         }
         dup->llm_cv.notify_all();  // 解锁 duplex_decode 里新来请求的 wait
-
+        if (!decode_req) continue;
 
         // ---- Phase 1: 消费最多 1 个 prefill packet（如果 encoder 还在途） ----
         //
@@ -11319,6 +11187,8 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         //   - chunk 0（老路径 prefill）：in_flight=0，直接 decode
         //   - chunk N (N≥1)：in_flight ≥ 1，必有 packet 在途；
         //     wait prefill_queue 非空，消费队头（encoder 是单线程 FIFO 顺序）
+        DuplexChunkTimings chunk_timings{};
+        bool have_packet_timings = false;
         if (dup->in_flight_prefill.load() > 0) {
             DuplexPrefillPacket * packet = nullptr;
             {
@@ -11337,10 +11207,19 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                // 🔧 [帧溯源] frame 的身份在 prefill 就定了：packet->index 就是调用方
+                // 传给 /v1/stream/prefill 的 cnt。decode 请求里的 round_idx 是可选的
+                // （HTTP 客户端通常不带，退化成 -1），不能依赖它，否则 simplex_round_idx
+                // 永远停在 0，TTS/T2W 落盘时记的 src_cnt 全是 0，wav 无法归帧。
+                ctx_omni->simplex_round_idx = packet->index;
+                ctx_omni->wav_turn_base     = packet->index * 1000;
+
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
                 if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
                     duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
                 }
+                chunk_timings = packet->timings;
+                have_packet_timings = true;
                 delete packet;
                 dup->in_flight_prefill.fetch_sub(1);
                 dup->in_flight_cv.notify_all();
@@ -11348,6 +11227,8 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         }
 
         // ---- Phase 2: decode ----
+        decode_req->have_packet_timings = have_packet_timings;
+        decode_req->chunk_timings = std::move(chunk_timings);
         bool ok = duplex_do_decode(ctx_omni, params, decode_req);
     }
     print_with_timestamp("Duplex: llm_thread stopped\n");
@@ -11376,7 +11257,7 @@ static bool duplex_prefill(omni_context * ctx_omni,
     {
         std::unique_lock<std::mutex> lk(dup->encoder_mtx);
         dup->encoder_cv.wait(lk, [&]{
-            return dup->encoder_queue.size() < dup->encoder_queue_cap>0?dup->encoder_queue_cap : DuplexPipeline::ENCODER_QUEUE_CAP
+            return dup->encoder_queue.size() < DuplexPipeline::ENCODER_QUEUE_CAP
                 || !dup->running.load();
         });
         if (!dup->running.load()) {
@@ -11649,7 +11530,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 // 🔧 [双工模式] 根据 duplex_mode 选择不同的 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
-                    ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
+                    //ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create tts thread (duplex mode) success\n");
                 } else {
                     ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
@@ -11880,7 +11761,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             tts_thread_running = true;
             if (ctx_omni->duplex_mode) {
                 ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
-                ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
+                //ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
             } else {
                 ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
@@ -12640,6 +12521,7 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
 
             r.ok       = ok;
             r.is_speak = !ctx_omni->ended_with_listen.load();
+            r.is_idle  = ctx_omni->duplex_frame_idle.load();
 
             // 收集本帧文本（剔除控制 token）
             {
@@ -12647,7 +12529,8 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
                 while (!ctx_omni->text_queue.empty()) {
                     std::string piece = ctx_omni->text_queue.front();
                     ctx_omni->text_queue.pop_front();
-                    if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__") continue;
+                    if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__"
+                        || piece == "__TURN_IDLE__") continue;
                     r.text += piece;
                 }
             }

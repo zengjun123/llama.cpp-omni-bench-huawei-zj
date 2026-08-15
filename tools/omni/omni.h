@@ -288,6 +288,17 @@ struct omni_context {
     // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
     std::atomic<bool> slide_last_was_listen{true};
 
+    // 🔧 [双工三态] 本帧是否是 IDLE：轮次已经通过 turn_eos 结束、且本帧没有产出
+    // 任何有效 TTS token。这种帧语义上等价于 LISTEN（说完了、在等用户），
+    // 但模型并没有采样出 <|listen|>，所以 ended_with_listen 仍是 false、
+    // 会被当成 SPEAK 上报，污染 speak 轮次划分和端到端延迟统计。
+    //
+    // 判据必须看 chunk_token_ids 是否为空，*不能* 看 response 是否为空：
+    // 存在 "response 被清理成空、但确实产出了 TTS token 并合成了音频" 的帧。
+    //
+    // 每次 duplex decode 开头重置，与 ended_with_listen 同生命周期。
+    std::atomic<bool> duplex_frame_idle{false};
+
     // 🔧 [与 Python 对齐] LLM 生成结束标志
     // 当 LLM 检测到 end token 时设置为 true
     // TTS 线程检查此标志来决定是否添加 text_eos_embed
@@ -360,6 +371,24 @@ struct omni_context {
     std::deque<std::string> text_queue;
     bool text_streaming = false;
     bool text_done_flag = false;
+
+    // Last completed duplex chunk stage timings (set by llm_thread after decode).
+    // Protected by stage_timings_mtx; read by HTTP SSE after text_done.
+    std::mutex stage_timings_mtx;
+    struct {
+        int    index = 0;
+        double vpm_ms = 0.0;
+        double apm_ms = 0.0;
+        double llm_prefill_ms = 0.0;
+        double llm_decode_ms = 0.0;
+        double tts_ms = 0.0;
+        double token2wav_ms = 0.0;
+        bool   valid = false;
+    } last_chunk_timings;
+    // Accumulators for async TTS/t2w of the current SPEAK turn (written by t2w thread).
+    double speak_tts_ms_acc = 0.0;
+    double speak_t2w_ms_acc = 0.0;
+    int    speak_timing_index = -1;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;
@@ -552,7 +581,11 @@ struct OmniDuplexFrameResult {
     int64_t  user_seq = 0;          // 与 OmniDuplexFrame.user_seq 一致
     int64_t  frame_id = -1;         // 内部分配的递增 id（1, 2, 3, ...）
     bool     ok = false;            // false = prefill 或 decode 失败
-    bool     is_speak = false;      // false = LISTEN，true = SPEAK
+    bool     is_speak = false;      // false = LISTEN，true = SPEAK（含 IDLE，见 is_idle）
+    // 轮次已 turn_eos 结束、本帧零 TTS token 产出。此时 is_speak 仍为 true
+    // （模型没采样出 <|listen|>），但语义上等价于 LISTEN，不应计入 speak 轮次
+    // 或端到端延迟统计。真正"在说话"的判据是 is_speak && !is_idle。
+    bool     is_idle = false;
     std::string text;               // 该帧 SPEAK 时生成的文本片段（已剔除控制 token）
     int      n_past_after = 0;      // 帧处理完成时的 ctx_llama n_past（调试用）
     double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）
@@ -609,7 +642,22 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
 // - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
 // - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
 // - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false, bool is_final_text_chunk = false);
+
+// ==================== TTS Eval 辅助函数声明 ====================
+// 从 omni.cpp 暴露的函数，供 omni-tts-eval.cpp 使用（原 diff-master.patch 内容，
+// 随框架重构重新导出：仅去掉 static，默认参数保留在此声明中）
+bool eval_tokens(struct omni_context* ctx_omni, common_params* params,
+                 std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false);
+bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params,
+                             std::vector<llama_token> tokens, int n_batch,
+                             int * n_past, float *& hidden_states);
+bool tts_emb_text(struct omni_context* ctx_omni, llama_token token_id,
+                  float * embedding_out, int tts_n_embd);
+bool tts_projector_semantic(struct omni_context* ctx_omni, const float * hidden,
+                            int n_tokens, int llm_n_embd,
+                            float * projected, int tts_n_embd);
+void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
