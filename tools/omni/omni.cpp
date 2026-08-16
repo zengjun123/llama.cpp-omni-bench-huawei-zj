@@ -3979,7 +3979,7 @@ struct DuplexPipeline {
     std::queue<DuplexPrefillPacket *> prefill_queue;
     std::mutex  llm_mtx;
     std::condition_variable llm_cv;
-    static constexpr size_t PREFILL_QUEUE_CAP = 26;
+    static constexpr size_t PREFILL_QUEUE_CAP = 32;
     size_t prefill_queue_cap = 0;
 
     // ---------- llm post----------
@@ -10752,6 +10752,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
             out_dec = ctx_omni->last_chunk_timings.llm_decode_ms;
             out_dir = ctx_omni->base_output_dir;
         }
+
+        decode_req->done.store(true);
+        dup->decode_done_cv.notify_all();
         {
             char buf[512];
             snprintf(buf, sizeof(buf),
@@ -10766,9 +10769,6 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params, Du
                 fclose(f);
             }
         }
-
-        decode_req->done.store(true);
-        dup->decode_done_cv.notify_all();
 
         //decode_req = nullptr;
         return true;
