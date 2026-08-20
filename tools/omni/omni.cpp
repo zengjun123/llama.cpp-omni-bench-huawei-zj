@@ -3979,7 +3979,7 @@ struct DuplexPipeline {
     std::queue<DuplexPrefillPacket *> prefill_queue;
     std::mutex  llm_mtx;
     std::condition_variable llm_cv;
-    static constexpr size_t PREFILL_QUEUE_CAP = 32;
+    static constexpr size_t PREFILL_QUEUE_CAP = 30;
     size_t prefill_queue_cap = 0;
 
     // ---------- llm post----------
@@ -6450,6 +6450,7 @@ void tts_record_func_duplex(struct omni_context * ctx_omni, common_params *param
 
     print_with_timestamp("Duplex: tts_record_thread stopped\n");
 }
+/*
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
     int tts_n_past = 0;
@@ -7067,7 +7068,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
 
     print_with_timestamp("TTS thread (duplex mode) stopped\n");
 }
-/*
+*/
+
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
     int tts_n_past = 0;
@@ -7626,7 +7628,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     }
 
     print_with_timestamp("TTS thread (duplex mode) stopped\n");
-}*/
+}
 
 void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     // TTS model state
@@ -11530,7 +11532,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 // 🔧 [双工模式] 根据 duplex_mode 选择不同的 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
-                    //ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
+                    ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create tts thread (duplex mode) success\n");
                 } else {
                     ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
@@ -11761,7 +11763,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             tts_thread_running = true;
             if (ctx_omni->duplex_mode) {
                 ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
-                //ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
+                ctx_omni->tts_record_thread = std::thread(tts_record_func_duplex, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
             } else {
                 ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
